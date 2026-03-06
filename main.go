@@ -16,6 +16,9 @@ import (
 	"github.com/joho/godotenv" 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"google.golang.org/api/option"
+
+	texttospeech "cloud.google.com/go/texttospeech/apiv1"
+	"cloud.google.com/go/texttospeech/apiv1/texttospeechpb"
 )
 
 func main() {
@@ -72,6 +75,8 @@ func main() {
         audio_played VARCHAR(50) NOT NULL CHECK (audio_played IN ('played', 'ignored')),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
+    
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_suggestions_tracking_id ON suggestions (tracking_id);
     `
 	if _, err = db.Exec(schema); err != nil {
 		log.Fatalf("failed to execute migration: %v", err)
@@ -196,14 +201,19 @@ func main() {
 		}
 		//クリーニング処理
 		rawResponse = strings.TrimSpace(rawResponse)
-		rawResponse = strings.TrimPrefix(rawResponse, "```json")
-		rawResponse = strings.TrimPrefix(rawResponse, "```")
-		rawResponse = strings.TrimSuffix(rawResponse, "```")
+		if strings.HasPrefix(rawResponse, "```json") {
+			rawResponse = strings.TrimPrefix(rawResponse, "```json")
+		} else if strings.HasPrefix(rawResponse, "```") {
+			rawResponse = strings.TrimPrefix(rawResponse, "```")
+		}
+		rawResponse = strings.TrimSuffix(strings.TrimSpace(rawResponse), "```")
 		rawResponse = strings.TrimSpace(rawResponse)
 
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(rawResponse))
 	})
+
+
 
 	// ユーザー作成
 	r.Post("/users", func(w http.ResponseWriter, r *http.Request) {
@@ -216,11 +226,15 @@ func main() {
 			return
 		}
 
-		var newID string
+		var id string
 		err := db.QueryRow(
-			"INSERT INTO users (external_user_id) VALUES ($1) RETURNING id",
+			`INSERT INTO users (external_user_id) 
+			 VALUES ($1) 
+			 ON CONFLICT (external_user_id) 
+			 DO UPDATE SET updated_at = CURRENT_TIMESTAMP 
+			 RETURNING id`,
 			req.ExternalUserID,
-		).Scan(&newID)
+		).Scan(&id)
 
 		if err != nil {
 			log.Printf("failed to insert user: %v", err)
@@ -230,7 +244,7 @@ func main() {
 
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{
-			"id":      newID,
+			"id":      id,
 			"message": "user created successfully",
 		})
 	})
@@ -288,6 +302,125 @@ func main() {
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"message": "task updated successfully"}`))
+	})
+	//提案を受け入れたかどうか記録
+	r.Post("/suggestions/log", func(w http.ResponseWriter, r *http.Request) {
+		type LogRequest struct {
+			UserID        string `json:"userId"`
+			TaskID        string `json:"taskId"`
+			TrackingID    string `json:"trackingId"`
+			Action        string `json:"action"`
+			Category      string `json:"category"`
+			OriginalText  string `json:"originalText"`
+			SuggestedText string `json:"suggestedText"`
+			ReasonText    string `json:"reasonText"`
+		}
+		var req LogRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		_, err := db.Exec(
+			`INSERT INTO suggestions 
+            (user_id, task_id, tracking_id, action, category, original_text, suggested_text, reason_text, audio_played) 
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'ignored')
+            ON CONFLICT (tracking_id) DO NOTHING`,
+			req.UserID, req.TaskID, req.TrackingID, req.Action, req.Category, req.OriginalText, req.SuggestedText, req.ReasonText,
+		)
+		if err != nil {
+			log.Printf("DB Log Error: %v", err)
+			http.Error(w, "failed to log", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+	})
+
+	// 提案アクション更新
+	r.Put("/suggestions/log/{trackingId}/action", func(w http.ResponseWriter, r *http.Request) {
+		trackingID := chi.URLParam(r, "trackingId")
+		type UpdateRequest struct {
+			Action string `json:"action"`
+		}
+		var req UpdateRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request", http.StatusBadRequest)
+			return
+		}
+
+		_, err := db.Exec("UPDATE suggestions SET action = $1 WHERE tracking_id = $2", req.Action, trackingID)
+		if err != nil {
+			log.Printf("Update Action Error: %v", err)
+			http.Error(w, "failed to update action", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	})
+
+	r.Post("/tts", func(w http.ResponseWriter, r *http.Request) {
+		type TTSRequest struct {
+			Text string `json:"text"`
+		}
+		var req TTSRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+
+		// 環境変数からサービスアカウントJSONを取得
+		saJson := os.Getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+		if saJson == "" {
+			log.Println("GOOGLE_SERVICE_ACCOUNT_JSON is not set")
+			http.Error(w, "TTS credentials not configured", http.StatusInternalServerError)
+			return
+		}
+
+		// TTSクライアントの作成
+		client, err := texttospeech.NewClient(ctx, option.WithCredentialsJSON([]byte(saJson)))
+		if err != nil {
+			log.Printf("failed to create TTS client: %v", err)
+			http.Error(w, "TTS client error", http.StatusInternalServerError)
+			return
+		}
+		defer client.Close()
+
+		//Chirpモデルの設定
+		ttsReq := &texttospeechpb.SynthesizeSpeechRequest{
+			Input: &texttospeechpb.SynthesisInput{
+				InputSource: &texttospeechpb.SynthesisInput_Text{Text: req.Text},
+			},
+			Voice: &texttospeechpb.VoiceSelectionParams{
+				LanguageCode: "en-US",
+				Name:         "en-us-Chirp3-HD-Achernar",
+			},
+			AudioConfig: &texttospeechpb.AudioConfig{
+				AudioEncoding: texttospeechpb.AudioEncoding_MP3,
+			},
+		}
+
+		// 音声生成の実行
+		resp, err := client.SynthesizeSpeech(ctx, ttsReq)
+		if err != nil {
+			log.Printf("failed to synthesize speech: %v", err)
+			http.Error(w, "TTS synthesis failed", http.StatusInternalServerError)
+			return
+		}
+
+		// バイナリデータ(MP3)を直接レスポンスとして返す
+		w.Header().Set("Content-Type", "audio/mpeg")
+		w.Write(resp.AudioContent)
+	})
+
+	// 音声再生ログ
+	r.Put("/suggestions/log/{trackingId}/audio", func(w http.ResponseWriter, r *http.Request) {
+		trackingID := chi.URLParam(r, "trackingId")
+		_, err := db.Exec("UPDATE suggestions SET audio_played = 'played' WHERE tracking_id = $1", trackingID)
+		if err != nil {
+			log.Printf("Update Audio Error: %v", err)
+			http.Error(w, "failed to update audio status", http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	// --- 6. サーバー起動 ---
