@@ -40,8 +40,7 @@ func main() {
 	}
 
 	// database
-	dsn := "postgres://user:password@localhost:5432/rephrasefb?sslmode=disable"
-	db, err := sql.Open("pgx", dsn)
+	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		log.Fatalf("failed to connect database: %v", err)
 	}
