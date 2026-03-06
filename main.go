@@ -321,6 +321,17 @@ func main() {
 			return
 		}
 
+		validCategories := map[string]bool{
+            "Mechanics":      true,
+            "Naturalness":    true,
+            "Clarity":        true,
+            "Mixed-Language": true,
+        }
+        if !validCategories[req.Category] {
+            log.Printf("Invalid category from AI: '%s', falling back to 'Naturalness'", req.Category)
+            req.Category = "Naturalness"
+        }
+
 		_, err := db.Exec(
 			`INSERT INTO suggestions 
             (user_id, task_id, tracking_id, action, category, original_text, suggested_text, reason_text, audio_played) 
